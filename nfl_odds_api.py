@@ -1,268 +1,263 @@
+# nfl_odds_api.py
 import os
 import requests
-from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+BASE = "https://api.the-odds-api.com/v4"
 
-# Canonical player prop market names per The Odds API v4
-# Map common aliases -> official keys
-MARKET_ALIASES = {
-    "player_rec_yds": "player_receiving_yds",
-    "player_rec": "player_receptions",
-    "receptions": "player_receptions",
-    "receiving_yds": "player_receiving_yds",
-    "rush_yds": "player_rush_yds",
-    "pass_yds": "player_pass_yds",
-}
-
-VALID_PLAYER_MARKETS = {
-    "player_anytime_td",
-    "player_first_td",
+# Keep this list tight to maximize hit-rate for props availability
+DEFAULT_MARKETS = [
     "player_pass_yds",
     "player_pass_tds",
-    "player_pass_interceptions",
     "player_rush_yds",
-    "player_rush_attempts",
-    "player_receptions",
+    "player_rush_tds",
     "player_receiving_yds",
-    "player_field_goals",
-}
+    "player_receptions",
+    "player_receiving_tds",
+]
 
-def _normalize_markets(markets: List[str]) -> List[str]:
-    norm = []
-    for m in markets:
-        m = m.strip()
-        m = MARKET_ALIASES.get(m, m)
-        if m not in VALID_PLAYER_MARKETS:
-            raise ValueError(f"Unsupported market: {m}. Valid: {sorted(VALID_PLAYER_MARKETS)}")
-        norm.append(m)
-    # de-dupe preserving order
-    seen = set()
-    out = []
-    for m in norm:
-        if m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
+PREFERRED_BOOKMAKERS = [
+    "draftkings",
+    "fanduel",
+    "betmgm",
+    "caesars",
+    "pointsbetus",
+]
+
+def _get(url: str, params: Dict[str, Any], timeout: int = 20) -> Any:
+    if not ODDS_API_KEY:
+        raise RuntimeError("ODDS_API_KEY is not set")
+    q = {**params, "apiKey": ODDS_API_KEY}
+    r = requests.get(url, params=q, timeout=timeout)
+    if r.status_code != 200:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Odds API error {r.status_code} at {url}: {detail}")
+    return r.json()
+
+def _detect_nfl_sport_key(hours_ahead: int = 48) -> str:
+    """Prefer preseason key if there are upcoming events in window, else regular."""
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=hours_ahead)
+    window = {
+        "commenceTimeFrom": now.replace(microsecond=0).isoformat(),
+        "commenceTimeTo": end.replace(microsecond=0).isoformat(),
+        "regions": "us",
+        "oddsFormat": "american",
+    }
+    preseason = "americanfootball_nfl_preseason"
+    regular = "americanfootball_nfl"
+    try:
+        ev = _get(f"{BASE}/sports/{preseason}/events", window)
+        if ev:
+            return preseason
+    except Exception:
+        pass
+    return regular
+
+def _list_events(sport_key: str, hours_ahead: int = 48) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=hours_ahead)
+    return _get(
+        f"{BASE}/sports/{sport_key}/events",
+        {
+            "commenceTimeFrom": now.replace(microsecond=0).isoformat(),
+            "commenceTimeTo": end.replace(microsecond=0).isoformat(),
+            "regions": "us",
+            "oddsFormat": "american",
+        },
+    )
+
+def _event_props(sport_key: str, event_id: str, markets: List[str]) -> Dict[str, Any]:
+    """Return the event odds payload (bookmakers → markets → outcomes) for selected markets."""
+    data = _get(
+        f"{BASE}/sports/{sport_key}/events/{event_id}/odds",
+        {
+            "regions": "us",
+            "oddsFormat": "american",
+            "markets": ",".join(markets),
+            "bookmakers": ",".join(PREFERRED_BOOKMAKERS),
+        },
+    )
+    # API sometimes returns a list; normalize to single dict with bookmakers
+    payloads = data if isinstance(data, list) else [data]
+    # Take the first that actually has bookmakers
+    for p in payloads:
+        if isinstance(p, dict) and p.get("bookmakers"):
+            return p
+    return payloads[0] if payloads else {}
 
 def fetch_nfl_props(
     markets: Optional[List[str]] = None,
-    *,
-    regions: str = "us",
-    bookmakers: Optional[List[str]] = None,
-    odds_format: str = "american",
-    date_format: str = "iso",
-    event_ids: Optional[List[str]] = None,
-    timeout: int = 20
+    hours_ahead: int = 48,
 ) -> List[Dict[str, Any]]:
-    """Fetch NFL player prop odds from The Odds API v4.
-
-    Args:
-        markets: List of player prop markets to fetch. Defaults to common yardage props.
-        regions: 'us', 'us2', 'eu', 'uk', 'au' (per API). Ignored if 'bookmakers' is provided.
-        bookmakers: Optional list of bookmaker keys to restrict results (e.g., ['draftkings','fanduel']).
-        odds_format: 'american' or 'decimal'.
-        date_format: 'iso' or 'unix'.
-        event_ids: Optional list of specific event IDs to limit response size.
-        timeout: Request timeout seconds.
-
-    Returns:
-        List of event objects with bookmaker odds for requested markets.
     """
-    if not ODDS_API_KEY:
-        raise EnvironmentError("ODDS_API_KEY is not set. Please set it in your environment.")
+    Returns a list of event dicts shaped like The Odds API event odds results:
+    [
+      {
+        "id": "...",
+        "home_team": "...",
+        "away_team": "...",
+        "commence_time": "...",
+        "bookmakers": [
+           {"key":"draftkings","title":"DraftKings","markets":[
+               {"key":"player_pass_yds","outcomes":[
+                   {"name":"Over","price":-110,"point":275.5,"description":"Josh Allen"}, ...
+               ]}
+           ]}
+        ]
+      }, ...
+    ]
+    """
+    mkts = markets or DEFAULT_MARKETS
+    sport_key = _detect_nfl_sport_key(hours_ahead)
+    events = _list_events(sport_key, hours_ahead)
+    if not events:
+        return []
 
-    if markets is None:
-        markets = ["player_pass_yds", "player_rush_yds", "player_receiving_yds", "player_receptions"]
-    markets = _normalize_markets(markets)
-
-    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "markets": ",".join(markets),
-        "oddsFormat": odds_format,
-        "dateFormat": date_format,
-        # includeLinks can be noisy; default to false
-        "includeLinks": "false",
-    }
-
-    if bookmakers:
-        params["bookmakers"] = ",".join(bookmakers)
-    else:
-        params["regions"] = regions
-
-    if event_ids:
-        params["eventIds"] = ",".join(event_ids)
-
-    resp = requests.get(base, params=params, timeout=timeout)
-    if resp.status_code != 200:
-        # Try to include message from API
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        ev_id = ev["id"]
         try:
-            msg = resp.json()
-        except Exception:
-            msg = resp.text
-        raise RuntimeError(f"The Odds API error {resp.status_code}: {msg}")
+            props_payload = _event_props(sport_key, ev_id, mkts)
+        except RuntimeError as e:
+            # Skip this event if props not available; keep the app alive
+            print(f"[NFL] Skipping event {ev_id}: {e}")
+            continue
 
-    return resp.json()
-
-def get_nfl_game_totals() -> List[Dict[str, Any]]:
-    """Fetch NFL game totals for environment classification"""
-    if not ODDS_API_KEY:
-        raise EnvironmentError("ODDS_API_KEY is not set. Please set it in your environment.")
-    
-    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "markets": "totals",
-        "oddsFormat": "american"
-    }
-    
-    resp = requests.get(base, params=params, timeout=20)
-    if resp.status_code != 200:
-        try:
-            msg = resp.json()
-        except Exception:
-            msg = resp.text
-        raise RuntimeError(f"The Odds API error {resp.status_code}: {msg}")
-    
-    return resp.json()
-
-def get_nfl_moneylines() -> List[Dict[str, Any]]:
-    """Fetch NFL moneylines for favored team identification"""
-    if not ODDS_API_KEY:
-        raise EnvironmentError("ODDS_API_KEY is not set. Please set it in your environment.")
-    
-    base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us", 
-        "markets": "h2h",
-        "oddsFormat": "american"
-    }
-    
-    resp = requests.get(base, params=params, timeout=20)
-    if resp.status_code != 200:
-        try:
-            msg = resp.json()
-        except Exception:
-            msg = resp.text
-        raise RuntimeError(f"The Odds API error {resp.status_code}: {msg}")
-    
-    return resp.json()
-
-def get_nfl_game_environment_map() -> Dict[str, Dict[str, Any]]:
-    """Get NFL game environment classifications and favored teams"""
-    try:
-        # Get totals and moneylines
-        totals_data = get_nfl_game_totals()
-        moneylines_data = get_nfl_moneylines()
-        
-        # Create lookup dictionaries
-        totals_lookup = {}
-        moneylines_lookup = {}
-        
-        # Process totals data
-        for game in totals_data:
-            matchup = f"{game['away_team']} @ {game['home_team']}"
-            
-            # Find totals market from bookmakers
-            total_point = None
-            over_odds = None
-            under_odds = None
-            
-            for bookmaker in game.get('bookmakers', []):
-                for market in bookmaker.get('markets', []):
-                    if market['key'] == 'totals':
-                        for outcome in market.get('outcomes', []):
-                            if outcome['name'] == 'Over':
-                                total_point = outcome.get('point', 0)
-                                over_odds = outcome.get('price', 0)
-                            elif outcome['name'] == 'Under':
-                                under_odds = outcome.get('price', 0)
-                        break
-                if total_point is not None:
-                    break
-            
-            if total_point is not None:
-                totals_lookup[matchup] = {
-                    'total': total_point,
-                    'over_odds': over_odds,
-                    'under_odds': under_odds
-                }
-        
-        # Process moneylines data for favored teams
-        for game in moneylines_data:
-            matchup = f"{game['away_team']} @ {game['home_team']}"
-            
-            # Find moneyline market
-            away_odds = None
-            home_odds = None
-            
-            for bookmaker in game.get('bookmakers', []):
-                for market in bookmaker.get('markets', []):
-                    if market['key'] == 'h2h':
-                        for outcome in market.get('outcomes', []):
-                            if outcome['name'] == game['away_team']:
-                                away_odds = outcome.get('price', 0)
-                            elif outcome['name'] == game['home_team']:
-                                home_odds = outcome.get('price', 0)
-                        break
-                if away_odds is not None and home_odds is not None:
-                    break
-            
-            if away_odds is not None and home_odds is not None:
-                # Determine favored team (lower odds = favored)
-                favored_team = game['home_team'] if home_odds < away_odds else game['away_team']
-                
-                moneylines_lookup[matchup] = {
-                    'away_team': game['away_team'],
-                    'home_team': game['home_team'],
-                    'favored_team': favored_team,
-                    'away_odds': away_odds,
-                    'home_odds': home_odds
-                }
-        
-        # Combine data and classify environments
-        environment_map = {}
-        
-        for matchup in set(list(totals_lookup.keys()) + list(moneylines_lookup.keys())):
-            totals_info = totals_lookup.get(matchup, {})
-            moneyline_info = moneylines_lookup.get(matchup, {})
-            
-            total_point = totals_info.get('total', 0)
-            over_odds = totals_info.get('over_odds', 0)
-            under_odds = totals_info.get('under_odds', 0)
-            
-            # NFL environment classification (different thresholds than MLB)
-            environment = "Neutral"
-            
-            if total_point >= 50 or (over_odds <= -115 and total_point >= 47):
-                environment = "High Scoring"
-            elif total_point <= 42 or (under_odds <= -115 and total_point <= 45):
-                environment = "Low Scoring"
-            
-            environment_map[matchup] = {
-                'environment': environment,
-                'total': total_point,
-                'over_odds': over_odds,
-                'under_odds': under_odds,
-                **moneyline_info
+        # Build event-shaped object expected by /api/nfl/props code
+        out.append(
+            {
+                "id": ev_id,
+                "commence_time": ev.get("commence_time"),
+                "home_team": ev.get("home_team"),
+                "away_team": ev.get("away_team"),
+                "teams": ev.get("teams", []),
+                "bookmakers": props_payload.get("bookmakers", []),
             }
-        
-        return environment_map
-        
-    except Exception as e:
-        print(f"Error getting NFL environment map: {e}")
-        return {}
+        )
+    return out
 
+# ---------- Environment (totals + favored team) ----------
 
-# Simple CLI test: prints number of events and first event keys
+def _bulk_odds(
+    sport_key: str,
+    markets: List[str],
+    hours_ahead: int = 48,
+) -> List[Dict[str, Any]]:
+    """Bulk odds call for H2H/Totals works fine for NFL; use tight window."""
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=hours_ahead)
+    return _get(
+        f"{BASE}/sports/{sport_key}/odds",
+        {
+            "regions": "us",
+            "oddsFormat": "american",
+            "dateFormat": "iso",
+            "markets": ",".join(markets),
+            "bookmakers": ",".join(PREFERRED_BOOKMAKERS),
+            "commenceTimeFrom": now.replace(microsecond=0).isoformat(),
+            "commenceTimeTo": end.replace(microsecond=0).isoformat(),
+        },
+    )
+
+def _classify_environment(total_point: float, over_odds: int, under_odds: int) -> str:
+    """
+    Simple classification like your MLB env:
+    - High: total >= 47.5 and Over priced better than Under
+    - Low: total <= 41.5 and Under priced better than Over
+    - Neutral: everything else
+    """
+    try:
+        t = float(total_point)
+    except Exception:
+        return "Neutral"
+    if t >= 47.5 and (isinstance(over_odds, (int, float)) and isinstance(under_odds, (int, float)) and over_odds <= under_odds):
+        return "High"
+    if t <= 41.5 and (isinstance(over_odds, (int, float)) and isinstance(under_odds, (int, float)) and under_odds <= over_odds):
+        return "Low"
+    return "Neutral"
+
+def get_nfl_game_environment_map(hours_ahead: int = 72) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns { "AWY @ HOME": {
+        "environment": "High|Neutral|Low",
+        "total": 46.5,
+        "over_odds": -105,
+        "under_odds": -115,
+        "favored_team": "KC",
+        "home_team": "KC",
+        "away_team": "BUF"
+    } }
+    """
+    from team_abbreviations import TEAM_ABBREVIATIONS  # you already use this in MLB
+
+    sport_key = _detect_nfl_sport_key(hours_ahead)
+    # H2H + Totals in one bulk call (bookmakers filtered)
+    data = _bulk_odds(sport_key, ["h2h", "totals"], hours_ahead)
+    env_map: Dict[str, Dict[str, Any]] = {}
+
+    # Build per-event structures for quick lookup
+    for event in data:
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+        if not home or not away:
+            continue
+        home_abbr = TEAM_ABBREVIATIONS.get(home, home)
+        away_abbr = TEAM_ABBREVIATIONS.get(away, away)
+        matchup_key = f"{away_abbr} @ {home_abbr}"
+
+        total_point = None
+        over_odds = None
+        under_odds = None
+        home_ml = None
+        away_ml = None
+
+        for bm in event.get("bookmakers", []):
+            for market in bm.get("markets", []):
+                mkey = market.get("key")
+                if mkey == "totals":
+                    for outc in market.get("outcomes", []):
+                        if outc.get("name") == "Over":
+                            total_point = outc.get("point")
+                            over_odds = outc.get("price")
+                        elif outc.get("name") == "Under":
+                            under_odds = outc.get("price")
+                elif mkey == "h2h":
+                    for outc in market.get("outcomes", []):
+                        if outc.get("name") == home:
+                            home_ml = outc.get("price")
+                        elif outc.get("name") == away:
+                            away_ml = outc.get("price")
+
+        favored_team = None
+        if home_ml is not None and away_ml is not None:
+            favored_team = home_abbr if home_ml < away_ml else away_abbr
+
+        label = _classify_environment(total_point, over_odds, under_odds) if total_point is not None else "Neutral"
+
+        env_map[matchup_key] = {
+            "environment": label,
+            "total": total_point,
+            "over_odds": over_odds,
+            "under_odds": under_odds,
+            "favored_team": favored_team,
+            "home_team": home_abbr,
+            "away_team": away_abbr,
+        }
+
+    return env_map
+
+# -------- CLI smoke test --------
 if __name__ == "__main__":
     try:
-        data = fetch_nfl_props()
-        print(f"Fetched {len(data)} NFL events with player props.")
-        if data:
-            print("First event keys:", list(data[0].keys()))
+        props = fetch_nfl_props()
+        print(f"Fetched {len(props)} NFL events with player props.")
+        env = get_nfl_game_environment_map()
+        print(f"Classified {len(env)} NFL matchups for environment.")
     except Exception as e:
         print("Error:", e)
